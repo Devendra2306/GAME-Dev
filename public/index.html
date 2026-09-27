@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Arena Car Combat</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="/socket.io/socket.io.js"></script>
+  <style>
+    body { margin: 0; overflow: hidden; background-color: #111; user-select: none; }
+    #ui-layer { position: absolute; inset: 0; pointer-events: none; z-index: 20; display: flex; flex-direction: column; }
+    .pointer-events-auto { pointer-events: auto; }
+    .text-shadow { text-shadow: 2px 2px 4px rgba(0,0,0,0.8); }
+    .health-bar-container { position: absolute; width: 100px; height: 10px; background: #333; transform: translate(-50%, -50%); border: 1px solid #000; }
+    .health-bar-fill { height: 100%; background: #0f0; transition: width 0.1s; }
+  </style>
+</head>
+<body>
+
+<div id="ui-layer">
+  <!-- HUD -->
+  <div class="flex justify-between p-6 text-white font-mono text-2xl text-shadow">
+    <div>
+      <div id="scoreDisplay">Score: 0</div>
+    </div>
+    <div>
+      <div id="healthDisplay" class="text-green-400 font-bold">HP: 100</div>
+    </div>
+  </div>
+
+  <div id="deadOverlay" class="hidden absolute inset-0 flex flex-col items-center justify-center bg-red-900/60 backdrop-blur-sm transition-opacity duration-300">
+    <h1 class="text-7xl font-black text-white italic mb-4 tracking-tighter">DESTROYED</h1>
+    <div class="text-3xl text-white font-mono">Respawning...</div>
+  </div>
+</div>
+
+<script>
+// --- Audio System ---
+const AudioSys = (() => {
+  let ctx = null;
+  const init = () => {
+    if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)();
+    if (ctx.state === 'suspended') ctx.resume();
+  };
+  const play = (freq, type, dur, vol) => {
+    if(!ctx) return;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, ctx.currentTime);
+    gain.gain.setValueAtTime(vol, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + dur);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start();
+    osc.stop(ctx.currentTime + dur);
+  };
+  const noise = (dur, vol) => {
+    if(!ctx) return;
+    const bufferSize = ctx.sampleRate * dur;
+    const buffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < bufferSize; i++) data[i] = Math.random() * 2 - 1;
+    const noiseSource = ctx.createBufferSource();
+    noiseSource.buffer = buffer;
+    
+    // lowpass filter for explosion
+    const filter = ctx.createBiquadFilter();
+    filter.type = 'lowpass';
+    filter.frequency.value = 1000;
+    
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(vol, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + dur);
+    
+    noiseSource.connect(filter);
+    filter.connect(gain);
+    gain.connect(ctx.destination);
+    noiseSource.start();
+  };
+  return {
+    init,
+    shoot: () => play(400, 'square', 0.1, 0.05),
+    hit: () => noise(0.5, 0.3)
+  };
+})();
+
+window.addEventListener('mousedown', AudioSys.init, { once: true });
+window.addEventListener('keydown', AudioSys.init, { once: true });
+
+// --- Three.js Setup ---
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x050510);
+scene.fog = new THREE.FogExp2(0x050510, 0.015);
+
+// Top down chase camera
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 200);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+document.body.insertBefore(renderer.domElement, document.body.firstChild);
+
+const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+dirLight.position.set(-10, 20, 10);
+scene.add(dirLight);
+scene.add(new THREE.AmbientLight(0x404050));
+
+// Arena Floor
+const MAP_SIZE = 100;
+const groundGeo = new THREE.PlaneGeometry(MAP_SIZE, MAP_SIZE);
+const groundMat = new THREE.MeshStandardMaterial({ color: 0x111122, roughness: 0.8 });
+const ground = new THREE.Mesh(groundGeo, groundMat);
+ground.rotation.x = -Math.PI / 2;
+scene.add(ground);
+
+const grid = new THREE.GridHelper(MAP_SIZE, 50, 0x00ff00, 0x003300);
+grid.position.y = 0.01;
+scene.add(grid);
+
+// Arena Walls
+const wallMat = new THREE.MeshStandardMaterial({ color: 0x222222, emissive: 0x110011 });
+const wallGeo = new THREE.BoxGeometry(MAP_SIZE, 4, 1);
+const w1 = new THREE.Mesh(wallGeo, wallMat); w1.position.set(0, 2, -MAP_SIZE/2); scene.add(w1);
+const w2 = new THREE.Mesh(wallGeo, wallMat); w2.position.set(0, 2, MAP_SIZE/2); scene.add(w2);
+const wallGeo2 = new THREE.BoxGeometry(1, 4, MAP_SIZE);
+const w3 = new THREE.Mesh(wallGeo2, wallMat); w3.position.set(-MAP_SIZE/2, 2, 0); scene.add(w3);
+const w4 = new THREE.Mesh(wallGeo2, wallMat); w4.position.set(MAP_SIZE/2, 2, 0); scene.add(w4);
+
+// --- Game Objects ---
+const carGeo = new THREE.BoxGeometry(1.5, 0.8, 3);
+const wheelGeo = new THREE.CylinderGeometry(0.4, 0.4, 0.3, 12);
+const bulletGeo = new THREE.SphereGeometry(0.2, 8, 8);
+const bulletMat = new THREE.MeshBasicMaterial({ color: 0xffff00 });
+
+function createCarMesh(colorHex) {
+  const group = new THREE.Group();
+  
+  const bodyMat = new THREE.MeshStandardMaterial({ color: colorHex, roughness: 0.4 });
+  const body = new THREE.Mesh(carGeo, bodyMat);
+  body.position.y = 0.6;
+  group.add(body);
+  
+  // Turret indicator
+  const turret = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.4, 1.2), new THREE.MeshStandardMaterial({ color: 0x222222 }));
+  turret.position.set(0, 1.1, 0.5);
+  group.add(turret);
+  
+  const wheelMat = new THREE.MeshStandardMaterial({ color: 0x111111 });
+  const w1 = new THREE.Mesh(wheelGeo, wheelMat); w1.rotation.z = Math.PI/2; w1.position.set(-0.8, 0.4, 1.0); group.add(w1);
+  const w2 = new THREE.Mesh(wheelGeo, wheelMat); w2.rotation.z = Math.PI/2; w2.position.set(0.8, 0.4, 1.0); group.add(w2);
+  const w3 = new THREE.Mesh(wheelGeo, wheelMat); w3.rotation.z = Math.PI/2; w3.position.set(-0.8, 0.4, -1.0); group.add(w3);
+  const w4 = new THREE.Mesh(wheelGeo, wheelMat); w4.rotation.z = Math.PI/2; w4.position.set(0.8, 0.4, -1.0); group.add(w4);
+  
+  return group;
+}
+
+const otherPlayers = {};
+let myId = null;
+let myCar = null;
+let myState = { dead: false, health: 100, score: 0 };
+
+const bulletMeshes = {};
+
+// --- Input ---
+const keys = { w: false, a: false, s: false, d: false, arrowup: false, arrowdown: false, arrowleft: false, arrowright: false };
+
+window.addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if (keys.hasOwnProperty(k)) keys[k] = true;
+  if (e.code === 'Space' && !myState.dead) socket.emit('shoot');
+});
+window.addEventListener('keyup', e => {
+  const k = e.key.toLowerCase();
+  if (keys.hasOwnProperty(k)) keys[k] = false;
+});
+
+// --- Networking ---
+const socket = io();
+
+socket.on('init', (data) => {
+  myId = data.id;
+  
+  for (const pid in data.players) {
+    const p = data.players[pid];
+    const mesh = createCarMesh(p.color);
+    mesh.position.set(p.x, 0, p.z);
+    mesh.rotation.y = p.rotation;
+    scene.add(mesh);
+    
+    if (pid === myId) {
+      myCar = mesh;
+      myState = p;
+    } else {
+      otherPlayers[pid] = { mesh, serverState: p };
+    }
+  }
+});
+
+socket.on('playerJoined', (p) => {
+  if (p.id === myId) return;
+  const mesh = createCarMesh(p.color);
+  mesh.position.set(p.x, 0, p.z);
+  scene.add(mesh);
+  otherPlayers[p.id] = { mesh, serverState: p };
+});
+
+socket.on('playerLeft', (pid) => {
+  if (otherPlayers[pid]) {
+    scene.remove(otherPlayers[pid].mesh);
+    delete otherPlayers[pid];
+  }
+});
+
+socket.on('state', (state) => {
+  // Update state for interpolation
+  for (const pid in state.players) {
+    const sp = state.players[pid];
+    if (pid === myId) {
+      if (myCar) {
+        myCar.position.set(sp.x, 0, sp.z);
+        myCar.rotation.y = sp.rotation;
+      }
+      myState = sp;
+      document.getElementById('healthDisplay').innerText = `HP: ${sp.health}`;
+      document.getElementById('scoreDisplay').innerText = `Score: ${sp.score}`;
+      if (sp.health <= 30) document.getElementById('healthDisplay').classList.replace('text-green-400', 'text-red-500');
+      else document.getElementById('healthDisplay').classList.replace('text-red-500', 'text-green-400');
+    } else if (otherPlayers[pid]) {
+      otherPlayers[pid].serverState = sp;
+    }
+  }
+  
+  // Sync bullets
+  const activeBulletIds = new Set();
+  state.bullets.forEach(b => {
+    activeBulletIds.add(b.id);
+    if (!bulletMeshes[b.id]) {
+      const mesh = new THREE.Mesh(bulletGeo, bulletMat);
+      scene.add(mesh);
+      bulletMeshes[b.id] = mesh;
+    }
+    bulletMeshes[b.id].position.set(b.x, 0.5, b.z);
+  });
+  
+  for (const bid in bulletMeshes) {
+    if (!activeBulletIds.has(parseInt(bid))) {
+      scene.remove(bulletMeshes[bid]);
+      delete bulletMeshes[bid];
+    }
+  }
+});
+
+socket.on('playSound', (type) => {
+  if (type === 'shoot') AudioSys.shoot();
+  if (type === 'hit') AudioSys.hit();
+});
+
+socket.on('playerDied', (data) => {
+  if (data.id === myId) {
+    document.getElementById('deadOverlay').classList.remove('hidden');
+    if (myCar) myCar.visible = false;
+  } else if (otherPlayers[data.id]) {
+    otherPlayers[data.id].mesh.visible = false;
+  }
+});
+
+socket.on('playerRespawned', (p) => {
+  if (p.id === myId) {
+    document.getElementById('deadOverlay').classList.add('hidden');
+    if (myCar) myCar.visible = true;
+  } else if (otherPlayers[p.id]) {
+    otherPlayers[p.id].mesh.visible = true;
+  }
+});
+
+// Send input to server repeatedly
+setInterval(() => {
+  if (!myId || myState.dead) return;
+  const input = {
+    up: keys.w || keys.arrowup,
+    down: keys.s || keys.arrowdown,
+    left: keys.a || keys.arrowleft,
+    right: keys.d || keys.arrowright
+  };
+  socket.emit('input', input);
+}, 1000/30);
+
+
+// --- Game Loop ---
+const clock = new THREE.Clock();
+
+function animate() {
+  requestAnimationFrame(animate);
+  const dt = Math.min(clock.getDelta(), 0.1);
+  
+  // Interpolate other players
+  for (const pid in otherPlayers) {
+    const op = otherPlayers[pid];
+    const target = op.serverState;
+    if (target && op.mesh.visible) {
+      op.mesh.position.lerp(new THREE.Vector3(target.x, 0, target.z), 10 * dt);
+      
+      // Interpolate rotation (simple lerp for now)
+      op.mesh.rotation.y += (target.rotation - op.mesh.rotation.y) * 10 * dt;
+    }
+  }
+  
+  // Camera Follow
+  if (myCar && !myState.dead) {
+    const camOffset = new THREE.Vector3(0, 15, -15);
+    camOffset.applyAxisAngle(new THREE.Vector3(0,1,0), myCar.rotation.y);
+    
+    const targetCamPos = myCar.position.clone().add(camOffset);
+    camera.position.lerp(targetCamPos, 5 * dt);
+    
+    camera.lookAt(myCar.position.clone().add(new THREE.Vector3(0,0,5).applyAxisAngle(new THREE.Vector3(0,1,0), myCar.rotation.y)));
+  }
+
+  renderer.render(scene, camera);
+}
+
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+animate();
+</script>
+</body>
+</html>
